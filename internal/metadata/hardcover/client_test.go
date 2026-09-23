@@ -819,10 +819,30 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 		if !slices.Equal(gotCodes, []string{"en", "eng"}) {
 			t.Errorf("languageCodes = %v, want [en eng]", gotCodes)
 		}
+		bookIDs, ok := req.Variables["bookIds"].([]interface{})
+		if !ok || len(bookIDs) != 1 || bookIDs[0] != float64(42) {
+			t.Errorf("bookIds = %#v, want [42]", req.Variables["bookIds"])
+		}
 		return gqlResponse(t, http.StatusOK, map[string]interface{}{
 			"editions": []map[string]interface{}{
 				{
 					"book":     map[string]interface{}{"id": 1, "slug": "translated-default"},
+					"language": map[string]interface{}{"code2": "en", "code3": "eng", "language": "English"},
+				},
+				{
+					"book":     map[string]interface{}{"id": 42, "slug": ""},
+					"language": map[string]interface{}{"code2": "en", "code3": "eng", "language": "English"},
+				},
+				{
+					"book":     map[string]interface{}{"id": 99, "slug": "not-requested"},
+					"language": map[string]interface{}{"code2": "en", "code3": "eng", "language": "English"},
+				},
+				{
+					"book":     map[string]interface{}{"id": 7, "slug": "malformed-language"},
+					"language": map[string]interface{}{},
+				},
+				{
+					"book":     map[string]interface{}{"id": 0, "slug": ""},
 					"language": map[string]interface{}{"code2": "en", "code3": "eng", "language": "English"},
 				},
 			},
@@ -834,6 +854,9 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 		{ForeignID: "hc:english-default", Language: "eng"},
 		{ForeignID: "hc:foreign-only", Language: "spa"},
 		{ForeignID: "hc:unknown"},
+		{ForeignID: "hc:42", Language: "spa"},
+		{ForeignID: "hc:malformed-language", Language: "por"},
+		{ForeignID: "hc:   ", Language: "eng"},
 		{ForeignID: "audible:B01CZ0WTEM", Language: "eng"},
 	}
 	got, err := c.GetAuthorWorkLanguageEvidence(context.Background(), books, []string{"eng"})
@@ -848,6 +871,8 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 		"hc:english-default":    {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
 		"hc:foreign-only":       {State: metadata.AuthorWorkLanguageNotAllowed, Language: "spa"},
 		"hc:unknown":            {State: metadata.AuthorWorkLanguageIndeterminate},
+		"hc:42":                 {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+		"hc:malformed-language": {State: metadata.AuthorWorkLanguageNotAllowed, Language: "por"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("evidence = %#v, want %#v", got, want)
@@ -855,6 +880,59 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 	if _, ok := got["audible:B01CZ0WTEM"]; ok {
 		t.Fatal("non-Hardcover supplement unexpectedly received Hardcover evidence")
 	}
+	if _, ok := got["hc:   "]; ok {
+		t.Fatal("blank Hardcover identity unexpectedly received evidence")
+	}
+}
+
+func TestGetAuthorWorkLanguageEvidence_SkipsRequestsWithoutApplicableInput(t *testing.T) {
+	t.Run("unrestricted profile", func(t *testing.T) {
+		requests := 0
+		c := newMockClient(func(*http.Request) (*http.Response, error) {
+			requests++
+			return gqlResponse(t, http.StatusOK, map[string]interface{}{}), nil
+		})
+		got, err := c.GetAuthorWorkLanguageEvidence(context.Background(), []models.Book{{ForeignID: "hc:work"}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 || requests != 0 {
+			t.Fatalf("evidence = %#v, requests = %d; want empty evidence and no request", got, requests)
+		}
+	})
+
+	t.Run("no Hardcover works", func(t *testing.T) {
+		requests := 0
+		c := newMockClient(func(*http.Request) (*http.Response, error) {
+			requests++
+			return gqlResponse(t, http.StatusOK, map[string]interface{}{}), nil
+		})
+		got, err := c.GetAuthorWorkLanguageEvidence(context.Background(), []models.Book{{ForeignID: "audible:B01CZ0WTEM", Language: "eng"}}, []string{"eng"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 || requests != 0 {
+			t.Fatalf("evidence = %#v, requests = %d; want empty evidence and no request", got, requests)
+		}
+	})
+
+	t.Run("missing token", func(t *testing.T) {
+		requests := 0
+		c := newUnconfiguredMockClient(func(*http.Request) (*http.Response, error) {
+			requests++
+			return gqlResponse(t, http.StatusOK, map[string]interface{}{}), nil
+		})
+		got, err := c.GetAuthorWorkLanguageEvidence(context.Background(), []models.Book{{ForeignID: "hc:translated-default", Language: "por"}}, []string{"eng"})
+		if !errors.Is(err, metadata.ErrProviderNotConfigured) {
+			t.Fatalf("error = %v, want ErrProviderNotConfigured", err)
+		}
+		if requests != 0 {
+			t.Fatalf("requests = %d, want 0", requests)
+		}
+		if evidence := got["hc:translated-default"]; evidence.State != metadata.AuthorWorkLanguageIndeterminate {
+			t.Fatalf("evidence = %+v, want indeterminate", evidence)
+		}
+	})
 }
 
 func TestGetAuthorWorkLanguageEvidence_FailureIsIndeterminate(t *testing.T) {

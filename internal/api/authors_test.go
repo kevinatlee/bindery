@@ -5499,6 +5499,94 @@ func TestFetchAuthorBooks_HardcoverEditionLanguageEvidence(t *testing.T) {
 	}
 }
 
+func TestFetchAuthorBooks_LanguageEvidenceFailureRemainsUnknown(t *testing.T) {
+	tests := []struct {
+		name            string
+		unknownBehavior string
+		wantBooks       int
+		wantSkipped     int
+	}{
+		{name: "unknown pass keeps work", unknownBehavior: models.UnknownLanguagePass, wantBooks: 1},
+		{name: "unknown fail skips work", unknownBehavior: models.UnknownLanguageFail, wantSkipped: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database, err := db.OpenMemory()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+
+			ctx := context.Background()
+			authorRepo := db.NewAuthorRepo(database)
+			bookRepo := db.NewBookRepo(database)
+			profileRepo := db.NewMetadataProfileRepo(database)
+			profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+			if err != nil || profile == nil {
+				t.Fatalf("GetByID(default profile): profile=%+v err=%v", profile, err)
+			}
+			profile.AllowedLanguages = "eng"
+			profile.UnknownLanguageBehavior = tt.unknownBehavior
+			if err := profileRepo.Update(ctx, profile); err != nil {
+				t.Fatal(err)
+			}
+			author := &models.Author{
+				ForeignID: "hc:evidence-error-author", Name: "Evidence Error Author", SortName: "Author, Evidence Error",
+				MetadataProvider: "hardcover", Monitored: false,
+			}
+			if err := authorRepo.Create(ctx, author); err != nil {
+				t.Fatal(err)
+			}
+			provider := &languageEvidenceMetaProvider{
+				stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{{
+					ForeignID: "hc:translated-default", Title: "Translated Default", SortTitle: "Translated Default",
+					Language: "por", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover",
+				}}},
+				evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+					"hc:translated-default": {State: metadata.AuthorWorkLanguageIndeterminate},
+				},
+				err: errors.New("language evidence unavailable"),
+			}
+			h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+			h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+			books, err := bookRepo.ListByAuthor(ctx, author.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(books) != tt.wantBooks {
+				t.Fatalf("books = %+v, want %d", books, tt.wantBooks)
+			}
+			if len(books) == 1 && books[0].Language != "" {
+				t.Errorf("persisted language = %q, want unknown after failed evidence lookup", books[0].Language)
+			}
+			if provider.calls != 1 {
+				t.Errorf("language evidence calls = %d, want 1", provider.calls)
+			}
+			summary := h.syncSummaries.get(author.ID)
+			if summary == nil || summary.SkippedLanguage != tt.wantSkipped {
+				t.Fatalf("sync summary = %+v, want skippedLanguage=%d", summary, tt.wantSkipped)
+			}
+		})
+	}
+}
+
+func TestAuthorWorkPassesLanguageFilter_UnrestrictedProfileIgnoresEvidence(t *testing.T) {
+	book := models.Book{ForeignID: "hc:work", Language: "por"}
+	evidence := map[string]metadata.AuthorWorkLanguageEvidence{
+		"hc:work": {State: metadata.AuthorWorkLanguageNotAllowed, Language: "por"},
+	}
+
+	allowed, indeterminate := authorWorkPassesLanguageFilter(&book, nil, true, evidence)
+	if !allowed || indeterminate {
+		t.Fatalf("allowed=%v indeterminate=%v, want true/false for an unrestricted profile", allowed, indeterminate)
+	}
+	if book.Language != "por" {
+		t.Fatalf("language = %q, want original display language preserved", book.Language)
+	}
+}
+
 // TestDeleteAuthor_PathContainment_RejectsOutsideRoots is the author-side
 // Wave 1 / Bundle B guard. When the delete-files sweep walks a book whose
 // file_path is outside every configured root, the on-disk file is left

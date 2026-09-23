@@ -233,6 +233,34 @@ func TestPreviewCatalogueReconciliation_IncompleteLanguageEvidenceIsIndeterminat
 	}
 }
 
+func TestPreviewCatalogueReconciliation_LanguageEvidenceFailureIsIndeterminate(t *testing.T) {
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{
+			{ForeignID: "hc:translated-default", Title: "Translated Default", Language: "por", MetadataProvider: "hardcover"},
+		}},
+		evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+			"hc:translated-default": {State: metadata.AuthorWorkLanguageIndeterminate},
+		},
+		err: errors.New("language evidence unavailable"),
+	}
+	f := newReconciliationFixture(t, provider)
+	f.createBook(t, "hc:translated-default", "Translated Default", "hardcover", models.BookStatusWanted)
+
+	preview, err := f.handler.buildCatalogueReconciliation(context.Background(), f.author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.Candidates) != 0 {
+		t.Fatalf("failed language lookup produced a removal candidate: %+v", preview.Candidates)
+	}
+	if preview.Summary.Kept != 1 || preview.Summary.Indeterminate != 1 {
+		t.Errorf("summary = %+v, want one indeterminate kept row", preview.Summary)
+	}
+	if provider.calls != 1 {
+		t.Errorf("language evidence calls = %d, want 1", provider.calls)
+	}
+}
+
 func TestApplyCatalogueReconciliation_RecomputesAndProtectsNewFiles(t *testing.T) {
 	provider := &stubMetaProvider{name: "hardcover", works: []models.Book{
 		{ForeignID: "hc:keep", Title: "Keep", Language: "eng", MetadataProvider: "hardcover"},
@@ -687,12 +715,13 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 	pages100 := 100
 	pages250 := 250
 	tests := []struct {
-		name          string
-		work          models.Book
-		profile       reconciliationProfile
-		evidence      editionEvidence
-		wantReason    string
-		indeterminate bool
+		name             string
+		work             models.Book
+		profile          reconciliationProfile
+		editionEvidence  editionEvidence
+		languageEvidence map[string]metadata.AuthorWorkLanguageEvidence
+		wantReason       string
+		indeterminate    bool
 	}{
 		{name: "accepted", work: models.Book{Title: "Dune"}},
 		{name: "empty title", work: models.Book{}, wantReason: reconcileReasonCatalogueFilter},
@@ -708,6 +737,30 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true}, indeterminate: true,
 		},
 		{
+			name:    "allowed edition overrides translated default",
+			work:    models.Book{ForeignID: "hc:translated", Title: "Translated", Language: "por"},
+			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true},
+			languageEvidence: map[string]metadata.AuthorWorkLanguageEvidence{
+				"hc:translated": {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+			},
+		},
+		{
+			name:    "definitive non-allowed evidence rejects work",
+			work:    models.Book{ForeignID: "hc:foreign", Title: "Foreign", Language: "eng"},
+			profile: reconciliationProfile{allowedLangs: []string{"eng"}}, wantReason: reconcileReasonLanguage,
+			languageEvidence: map[string]metadata.AuthorWorkLanguageEvidence{
+				"hc:foreign": {State: metadata.AuthorWorkLanguageNotAllowed, Language: "spa"},
+			},
+		},
+		{
+			name:    "indeterminate evidence protects translated default",
+			work:    models.Book{ForeignID: "hc:unknown", Title: "Unknown", Language: "por"},
+			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true}, indeterminate: true,
+			languageEvidence: map[string]metadata.AuthorWorkLanguageEvidence{
+				"hc:unknown": {State: metadata.AuthorWorkLanguageIndeterminate},
+			},
+		},
+		{
 			name: "part book", work: models.Book{Title: "The New Turing Omnibus"},
 			profile: reconciliationProfile{skipPartBooks: true}, wantReason: reconcileReasonPartBook,
 		},
@@ -721,23 +774,23 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 		},
 		{
 			name: "missing isbn", work: models.Book{Title: "No ISBN"},
-			profile: reconciliationProfile{skipMissingISBN: true}, evidence: editionEvidence{known: true}, wantReason: reconcileReasonISBN,
+			profile: reconciliationProfile{skipMissingISBN: true}, editionEvidence: editionEvidence{known: true}, wantReason: reconcileReasonISBN,
 		},
 		{
 			name: "below page floor", work: models.Book{Title: "Short"},
-			profile:    reconciliationProfile{minPages: 200},
-			evidence:   editionEvidence{known: true, editions: []models.Edition{{NumPages: &pages100}}},
-			wantReason: reconcileReasonPages,
+			profile:         reconciliationProfile{minPages: 200},
+			editionEvidence: editionEvidence{known: true, editions: []models.Edition{{NumPages: &pages100}}},
+			wantReason:      reconcileReasonPages,
 		},
 		{
 			name: "page floor accepted", work: models.Book{Title: "Long"},
-			profile:  reconciliationProfile{minPages: 200},
-			evidence: editionEvidence{known: true, editions: []models.Edition{{NumPages: &pages250}}},
+			profile:         reconciliationProfile{minPages: 200},
+			editionEvidence: editionEvidence{known: true, editions: []models.Edition{{NumPages: &pages250}}},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, indeterminate := reconciliationRejectReason(tt.work, "test author", tt.profile, tt.evidence, nil)
+			reason, indeterminate := reconciliationRejectReason(tt.work, "test author", tt.profile, tt.editionEvidence, tt.languageEvidence)
 			if reason != tt.wantReason || indeterminate != tt.indeterminate {
 				t.Fatalf("reason=%q indeterminate=%v, want %q/%v", reason, indeterminate, tt.wantReason, tt.indeterminate)
 			}
