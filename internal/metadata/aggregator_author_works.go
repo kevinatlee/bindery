@@ -89,6 +89,44 @@ type workLanguageFiller interface {
 	FillMissingWorkLanguages(ctx context.Context, books []models.Book) int
 }
 
+// AuthorWorkLanguageEvidenceState says what a provider established about a
+// work for one metadata profile's allowed-language set. It is deliberately
+// separate from Book.Language: an edition language is evidence about an
+// edition, not necessarily an authoritative language for the abstract work.
+type AuthorWorkLanguageEvidenceState uint8
+
+const (
+	AuthorWorkLanguageIndeterminate AuthorWorkLanguageEvidenceState = iota
+	AuthorWorkLanguageAllowed
+	AuthorWorkLanguageNotAllowed
+)
+
+// AuthorWorkLanguageEvidence is transient, profile-specific catalogue
+// evidence. Language is populated when the provider found a matching allowed
+// edition, or with its best known non-allowed edition language when absence of
+// an allowed edition was established.
+type AuthorWorkLanguageEvidence struct {
+	State    AuthorWorkLanguageEvidenceState
+	Language string
+}
+
+type authorWorkLanguageEvidenceProvider interface {
+	GetAuthorWorkLanguageEvidence(ctx context.Context, books []models.Book, allowed []string) (map[string]AuthorWorkLanguageEvidence, error)
+}
+
+// GetAuthorWorkLanguageEvidence asks the primary provider for bounded,
+// profile-specific edition evidence. Unsupported providers return nil. A
+// provider may return indeterminate entries alongside an error so callers can
+// preserve strict ingestion behavior without turning a failed lookup into
+// destructive reconciliation evidence.
+func (a *Aggregator) GetAuthorWorkLanguageEvidence(ctx context.Context, books []models.Book, allowed []string) (map[string]AuthorWorkLanguageEvidence, error) {
+	resolver, ok := a.primary.(authorWorkLanguageEvidenceProvider)
+	if !ok || len(allowed) == 0 {
+		return nil, nil
+	}
+	return resolver.GetAuthorWorkLanguageEvidence(ctx, books, allowed)
+}
+
 // FillMissingAuthorWorkLanguages asks the primary provider to derive a language
 // for any book in books that has Language=="" by edition-sampling, mutating the
 // slice in place. It is a no-op when the primary provider lacks the capability.

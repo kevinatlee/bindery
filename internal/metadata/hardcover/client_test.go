@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -780,6 +782,115 @@ func TestGetAuthorWorksByName_NoTokenSkipsRequest(t *testing.T) {
 	}
 	if books != nil {
 		t.Fatalf("books = %+v, want nil", books)
+	}
+}
+
+func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T) {
+	requests := 0
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
+		requests++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var req gqlRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatal(err)
+		}
+		for _, fragment := range []string{
+			"distinct_on: [book_id]",
+			"order_by: [{book_id: asc}, {id: asc}]",
+			"language { code2 code3 language }",
+			"code2: {_in: $languageCodes}",
+			"code3: {_in: $languageCodes}",
+		} {
+			if !strings.Contains(req.Query, fragment) {
+				t.Errorf("query missing %q: %s", fragment, req.Query)
+			}
+		}
+		codes, ok := req.Variables["languageCodes"].([]interface{})
+		if !ok {
+			t.Fatalf("languageCodes = %#v", req.Variables["languageCodes"])
+		}
+		gotCodes := make([]string, 0, len(codes))
+		for _, code := range codes {
+			gotCodes = append(gotCodes, code.(string))
+		}
+		if !slices.Equal(gotCodes, []string{"en", "eng"}) {
+			t.Errorf("languageCodes = %v, want [en eng]", gotCodes)
+		}
+		return gqlResponse(t, http.StatusOK, map[string]interface{}{
+			"editions": []map[string]interface{}{
+				{
+					"book":     map[string]interface{}{"id": 1, "slug": "translated-default"},
+					"language": map[string]interface{}{"code2": "en", "code3": "eng", "language": "English"},
+				},
+			},
+		}), nil
+	})
+
+	books := []models.Book{
+		{ForeignID: "hc:translated-default", Language: "por"},
+		{ForeignID: "hc:english-default", Language: "eng"},
+		{ForeignID: "hc:foreign-only", Language: "spa"},
+		{ForeignID: "hc:unknown"},
+		{ForeignID: "audible:B01CZ0WTEM", Language: "eng"},
+	}
+	got, err := c.GetAuthorWorkLanguageEvidence(context.Background(), books, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want one batch request", requests)
+	}
+	want := map[string]metadata.AuthorWorkLanguageEvidence{
+		"hc:translated-default": {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+		"hc:english-default":    {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+		"hc:foreign-only":       {State: metadata.AuthorWorkLanguageNotAllowed, Language: "spa"},
+		"hc:unknown":            {State: metadata.AuthorWorkLanguageIndeterminate},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("evidence = %#v, want %#v", got, want)
+	}
+	if _, ok := got["audible:B01CZ0WTEM"]; ok {
+		t.Fatal("non-Hardcover supplement unexpectedly received Hardcover evidence")
+	}
+}
+
+func TestGetAuthorWorkLanguageEvidence_FailureIsIndeterminate(t *testing.T) {
+	c := newMockClient(func(*http.Request) (*http.Response, error) {
+		return gqlResponse(t, http.StatusInternalServerError, `{"error":"upstream unavailable"}`), nil
+	})
+	got, err := c.GetAuthorWorkLanguageEvidence(context.Background(), []models.Book{
+		{ForeignID: "hc:translated-default", Language: "por"},
+	}, []string{"eng"})
+	if err == nil {
+		t.Fatal("expected lookup error")
+	}
+	if evidence := got["hc:translated-default"]; evidence.State != metadata.AuthorWorkLanguageIndeterminate {
+		t.Fatalf("evidence after failure = %+v, want indeterminate", evidence)
+	}
+}
+
+func TestGetAuthorWorkLanguageEvidence_SeventyEightWorksUseOneRequest(t *testing.T) {
+	requests := 0
+	c := newMockClient(func(*http.Request) (*http.Response, error) {
+		requests++
+		return gqlResponse(t, http.StatusOK, map[string]interface{}{"editions": []interface{}{}}), nil
+	})
+	books := make([]models.Book, 78)
+	for i := range books {
+		books[i] = models.Book{ForeignID: fmt.Sprintf("hc:work-%d", i), Language: "por"}
+	}
+	got, err := c.GetAuthorWorkLanguageEvidence(context.Background(), books, []string{"eng"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1 for a 78-work catalogue", requests)
+	}
+	if len(got) != len(books) {
+		t.Fatalf("evidence rows = %d, want %d", len(got), len(books))
 	}
 }
 

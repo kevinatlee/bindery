@@ -177,6 +177,62 @@ func TestPreviewCatalogueReconciliation_ReportsOnlySafeCandidates(t *testing.T) 
 	_ = imported
 }
 
+func TestPreviewCatalogueReconciliation_TranslatedDefaultKeepsEnglishAudibleRow(t *testing.T) {
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{
+			{ForeignID: "hc:translated-default", Title: "Corrupt", Language: "por", MetadataProvider: "hardcover"},
+		}},
+		evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+			"hc:translated-default": {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+		},
+	}
+	f := newReconciliationFixture(t, provider)
+	local := f.createBook(t, "audible:B01CZ0WTEM", "Corrupt", "audible", models.BookStatusWanted)
+	local.Language = "eng"
+	local.MediaType = models.MediaTypeAudiobook
+	if err := f.books.Update(context.Background(), local); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := f.handler.buildCatalogueReconciliation(context.Background(), f.author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.Candidates) != 0 {
+		t.Fatalf("translated default made the English Audible row removable: %+v", preview.Candidates)
+	}
+	if preview.Summary.Kept != 1 || preview.Summary.Indeterminate != 0 {
+		t.Errorf("summary = %+v, want one definitively kept row", preview.Summary)
+	}
+	if provider.calls != 1 {
+		t.Errorf("language evidence calls = %d, want 1", provider.calls)
+	}
+}
+
+func TestPreviewCatalogueReconciliation_IncompleteLanguageEvidenceIsIndeterminate(t *testing.T) {
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{
+			{ForeignID: "hc:ambiguous", Title: "Ambiguous", Language: "por", MetadataProvider: "hardcover"},
+		}},
+		evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+			"hc:ambiguous": {State: metadata.AuthorWorkLanguageIndeterminate},
+		},
+	}
+	f := newReconciliationFixture(t, provider)
+	f.createBook(t, "hc:ambiguous", "Ambiguous", "hardcover", models.BookStatusWanted)
+
+	preview, err := f.handler.buildCatalogueReconciliation(context.Background(), f.author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.Candidates) != 0 {
+		t.Fatalf("incomplete language evidence produced a removal candidate: %+v", preview.Candidates)
+	}
+	if preview.Summary.Kept != 1 || preview.Summary.Indeterminate != 1 {
+		t.Errorf("summary = %+v, want one indeterminate kept row", preview.Summary)
+	}
+}
+
 func TestApplyCatalogueReconciliation_RecomputesAndProtectsNewFiles(t *testing.T) {
 	provider := &stubMetaProvider{name: "hardcover", works: []models.Book{
 		{ForeignID: "hc:keep", Title: "Keep", Language: "eng", MetadataProvider: "hardcover"},
@@ -681,7 +737,7 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, indeterminate := reconciliationRejectReason(tt.work, "test author", tt.profile, tt.evidence)
+			reason, indeterminate := reconciliationRejectReason(tt.work, "test author", tt.profile, tt.evidence, nil)
 			if reason != tt.wantReason || indeterminate != tt.indeterminate {
 				t.Fatalf("reason=%q indeterminate=%v, want %q/%v", reason, indeterminate, tt.wantReason, tt.indeterminate)
 			}

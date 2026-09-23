@@ -125,6 +125,18 @@ type stubMetaProvider struct {
 	getAuthorGate chan struct{}
 }
 
+type languageEvidenceMetaProvider struct {
+	stubMetaProvider
+	evidence map[string]metadata.AuthorWorkLanguageEvidence
+	err      error
+	calls    int
+}
+
+func (p *languageEvidenceMetaProvider) GetAuthorWorkLanguageEvidence(_ context.Context, _ []models.Book, _ []string) (map[string]metadata.AuthorWorkLanguageEvidence, error) {
+	p.calls++
+	return p.evidence, p.err
+}
+
 func (p *stubMetaProvider) Name() string {
 	if p.name != "" {
 		return p.name
@@ -5403,6 +5415,87 @@ func TestFetchAuthorBooks_MajorityLanguageFallbackRescuesUnresolvedWork(t *testi
 
 	if summary := h.syncSummaries.get(author.ID); summary != nil && summary.SkippedLanguage != 0 {
 		t.Errorf("summary.SkippedLanguage = %d, want 0 (the unresolved work should have been rescued, not skipped)", summary.SkippedLanguage)
+	}
+}
+
+// TestFetchAuthorBooks_HardcoverEditionLanguageEvidence is the regression for
+// a translated default edition (for example, a Portuguese default for an
+// English work). The default remains useful evidence, but an allowed-language
+// edition found by the bounded Hardcover batch query wins for catalogue
+// filtering. Complete non-allowed evidence and unresolved evidence still
+// honor a strict profile.
+func TestFetchAuthorBooks_HardcoverEditionLanguageEvidence(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile): profile=%+v err=%v", profile, err)
+	}
+	profile.AllowedLanguages = "eng"
+	profile.UnknownLanguageBehavior = models.UnknownLanguageFail
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{
+		ForeignID: "hc:test-author", Name: "Test Author", SortName: "Author, Test",
+		MetadataProvider: "hardcover", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{
+			{ForeignID: "hc:translated-default", Title: "Translated Default", SortTitle: "Translated Default", Language: "por", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+			{ForeignID: "hc:english-default", Title: "English Default", SortTitle: "English Default", Language: "eng", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+			{ForeignID: "hc:foreign-only", Title: "Foreign Only", SortTitle: "Foreign Only", Language: "spa", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+			{ForeignID: "hc:unresolved", Title: "Unresolved", SortTitle: "Unresolved", Language: "por", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+		}},
+		evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+			"hc:translated-default": {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+			"hc:english-default":    {State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+			"hc:foreign-only":       {State: metadata.AuthorWorkLanguageNotAllowed, Language: "spa"},
+			"hc:unresolved":         {State: metadata.AuthorWorkLanguageIndeterminate},
+		},
+	}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+	books, err := bookRepo.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTitle := make(map[string]models.Book, len(books))
+	for _, book := range books {
+		byTitle[book.Title] = book
+	}
+	for _, title := range []string{"Translated Default", "English Default"} {
+		book, ok := byTitle[title]
+		if !ok {
+			t.Errorf("%q was rejected by the English-only profile", title)
+			continue
+		}
+		if book.Language != "eng" {
+			t.Errorf("%q Language = %q, want resolved allowed language eng", title, book.Language)
+		}
+	}
+	for _, title := range []string{"Foreign Only", "Unresolved"} {
+		if _, ok := byTitle[title]; ok {
+			t.Errorf("%q survived a strict English-only profile", title)
+		}
+	}
+	if provider.calls != 1 {
+		t.Errorf("language evidence calls = %d, want 1 batched lookup", provider.calls)
+	}
+	if summary := h.syncSummaries.get(author.ID); summary == nil || summary.SkippedLanguage != 2 {
+		t.Fatalf("sync summary = %+v, want two language skips", summary)
 	}
 }
 
