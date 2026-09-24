@@ -226,8 +226,10 @@ func (h *AuthorHandler) buildCatalogueReconciliation(ctx context.Context, author
 	}
 	works := snapshot.Books
 	languageEvidence, languageEvidenceErr := h.meta.GetAuthorWorkLanguageEvidence(ctx, works, profile.allowedLangs)
+	languageEvidenceFailed := languageEvidenceErr != nil
 	if languageEvidenceErr != nil {
-		slog.Warn("catalogue reconciliation language evidence lookup failed; affected works will be kept as indeterminate",
+		languageEvidence = nil
+		slog.Warn("catalogue reconciliation language evidence lookup failed; works will be kept as indeterminate",
 			"author", author.Name, "error", languageEvidenceErr)
 	}
 	if len(profile.allowedLangs) > 0 {
@@ -267,7 +269,7 @@ func (h *AuthorHandler) buildCatalogueReconciliation(ctx context.Context, author
 	rejectedTitles := make(map[string]string)
 	normalizedAuthor := strings.ToLower(strings.TrimSpace(author.Name))
 	for _, work := range works {
-		reason, indeterminate := reconciliationRejectReason(work, normalizedAuthor, profile, editions[work.ForeignID], languageEvidence)
+		reason, indeterminate := reconciliationRejectReason(work, normalizedAuthor, profile, editions[work.ForeignID], languageEvidence, languageEvidenceFailed)
 		if reason == "" {
 			if strings.TrimSpace(work.ForeignID) != "" {
 				acceptedIDs[work.ForeignID] = struct{}{}
@@ -401,12 +403,15 @@ func (h *AuthorHandler) buildCatalogueReconciliation(ctx context.Context, author
 	return result, nil
 }
 
-func reconciliationRejectReason(work models.Book, normalizedAuthor string, profile reconciliationProfile, evidence editionEvidence, languageEvidence map[string]metadata.AuthorWorkLanguageEvidence) (string, bool) {
+func reconciliationRejectReason(work models.Book, normalizedAuthor string, profile reconciliationProfile, evidence editionEvidence, languageEvidence map[string]metadata.AuthorWorkLanguageEvidence, languageEvidenceFailed bool) (string, bool) {
 	normalizedTitle := strings.ToLower(strings.TrimSpace(work.Title))
 	if normalizedTitle == "" || normalizedTitle == normalizedAuthor || work.IsCompilation || metadata.IsUnambiguousBundleTitle(work.Title) {
 		return reconcileReasonCatalogueFilter, false
 	}
 	if len(profile.allowedLangs) > 0 {
+		if languageEvidenceFailed {
+			return "", true
+		}
 		languageAllowed, indeterminate := authorWorkPassesLanguageFilter(&work, profile.allowedLangs, profile.unknownFail, languageEvidence)
 		if indeterminate {
 			return "", true

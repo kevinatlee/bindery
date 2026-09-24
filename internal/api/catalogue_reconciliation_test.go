@@ -212,7 +212,7 @@ func TestPreviewCatalogueReconciliation_TranslatedDefaultKeepsEnglishAudibleRow(
 func TestPreviewCatalogueReconciliation_IncompleteLanguageEvidenceIsIndeterminate(t *testing.T) {
 	provider := &languageEvidenceMetaProvider{
 		stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{
-			{ForeignID: "hc:ambiguous", Title: "Ambiguous", Language: "por", MetadataProvider: "hardcover"},
+			{ForeignID: "hc:ambiguous", Title: "Ambiguous", MetadataProvider: "hardcover"},
 		}},
 		evidence: map[string]metadata.AuthorWorkLanguageEvidence{
 			"hc:ambiguous": {State: metadata.AuthorWorkLanguageIndeterminate},
@@ -715,13 +715,14 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 	pages100 := 100
 	pages250 := 250
 	tests := []struct {
-		name             string
-		work             models.Book
-		profile          reconciliationProfile
-		editionEvidence  editionEvidence
-		languageEvidence map[string]metadata.AuthorWorkLanguageEvidence
-		wantReason       string
-		indeterminate    bool
+		name                   string
+		work                   models.Book
+		profile                reconciliationProfile
+		editionEvidence        editionEvidence
+		languageEvidence       map[string]metadata.AuthorWorkLanguageEvidence
+		languageEvidenceFailed bool
+		wantReason             string
+		indeterminate          bool
 	}{
 		{name: "accepted", work: models.Book{Title: "Dune"}},
 		{name: "empty title", work: models.Book{}, wantReason: reconcileReasonCatalogueFilter},
@@ -753,12 +754,36 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 			},
 		},
 		{
-			name:    "indeterminate evidence protects translated default",
-			work:    models.Book{ForeignID: "hc:unknown", Title: "Unknown", Language: "por"},
+			name:    "indeterminate evidence protects blank scalar",
+			work:    models.Book{ForeignID: "hc:unknown", Title: "Unknown"},
 			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true}, indeterminate: true,
 			languageEvidence: map[string]metadata.AuthorWorkLanguageEvidence{
 				"hc:unknown": {State: metadata.AuthorWorkLanguageIndeterminate},
 			},
+		},
+		{
+			name:    "indeterminate evidence uses allowed scalar",
+			work:    models.Book{ForeignID: "hc:allowed-scalar", Title: "Allowed", Language: "eng"},
+			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true},
+			languageEvidence: map[string]metadata.AuthorWorkLanguageEvidence{
+				"hc:allowed-scalar": {State: metadata.AuthorWorkLanguageIndeterminate},
+			},
+		},
+		{
+			name:    "indeterminate evidence uses non-allowed scalar",
+			work:    models.Book{ForeignID: "hc:non-allowed-scalar", Title: "Foreign", Language: "por"},
+			profile: reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true},
+			languageEvidence: map[string]metadata.AuthorWorkLanguageEvidence{
+				"hc:non-allowed-scalar": {State: metadata.AuthorWorkLanguageIndeterminate},
+			},
+			wantReason: reconcileReasonLanguage,
+		},
+		{
+			name:                   "failed evidence lookup protects non-allowed scalar",
+			work:                   models.Book{ForeignID: "hc:failed", Title: "Failed", Language: "por"},
+			profile:                reconciliationProfile{allowedLangs: []string{"eng"}, unknownFail: true},
+			languageEvidenceFailed: true,
+			indeterminate:          true,
 		},
 		{
 			name: "part book", work: models.Book{Title: "The New Turing Omnibus"},
@@ -790,7 +815,7 @@ func TestReconciliationRejectReason_ProfileReasonsAndIndeterminateEvidence(t *te
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, indeterminate := reconciliationRejectReason(tt.work, "test author", tt.profile, tt.editionEvidence, tt.languageEvidence)
+			reason, indeterminate := reconciliationRejectReason(tt.work, "test author", tt.profile, tt.editionEvidence, tt.languageEvidence, tt.languageEvidenceFailed)
 			if reason != tt.wantReason || indeterminate != tt.indeterminate {
 				t.Fatalf("reason=%q indeterminate=%v, want %q/%v", reason, indeterminate, tt.wantReason, tt.indeterminate)
 			}

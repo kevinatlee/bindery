@@ -568,10 +568,13 @@ Things worth knowing:
   editions for each author work in one batched request. A translated default
   edition is not treated as the language of the whole work: any edition in an
   allowed language keeps the work, while a work is rejected as non-allowed
-  only when the lookup completes and finds no allowed edition. If that
-  evidence cannot be resolved, normal refreshes use the profile's **When book
-  language is unknown** setting; **Reconcile catalogue** keeps the row as
-  indeterminate rather than offering it for removal.
+  only when the lookup completes and finds no allowed edition. This filtering
+  evidence does not rewrite the displayed language, which remains the
+  provider's preferred/default language or the user's locked value. If the
+  evidence is indeterminate or its lookup fails, normal refreshes fall through
+  to the existing edition-sampled, author-majority, and scalar language before
+  applying **When book language is unknown**. **Reconcile catalogue** treats a
+  failed lookup as indeterminate rather than offering the row for removal.
 - **Google Books** (free API key) and **Audnexus/Audible** (audiobook
   narrator, duration, by ASIN) enrich further.
 

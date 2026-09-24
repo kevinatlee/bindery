@@ -85,7 +85,7 @@ func TestAggregator_GetAuthorWorkLanguageEvidence_UnsupportedOrUnrestricted(t *t
 	})
 }
 
-func TestAggregator_GetAuthorWorkLanguageEvidence_PreservesIndeterminateOnError(t *testing.T) {
+func TestAggregator_GetAuthorWorkLanguageEvidence_DiscardsEvidenceOnError(t *testing.T) {
 	lookupErr := errors.New("language evidence unavailable")
 	want := map[string]AuthorWorkLanguageEvidence{
 		"hc:translated-default": {State: AuthorWorkLanguageIndeterminate},
@@ -101,8 +101,8 @@ func TestAggregator_GetAuthorWorkLanguageEvidence_PreservesIndeterminateOnError(
 	if !errors.Is(err, lookupErr) {
 		t.Fatalf("error = %v, want %v", err, lookupErr)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("evidence after error = %#v, want indeterminate evidence %#v", got, want)
+	if got != nil {
+		t.Fatalf("evidence after error = %#v, want nil so scalar fallbacks remain authoritative", got)
 	}
 }
 

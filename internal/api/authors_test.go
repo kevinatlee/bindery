@@ -137,6 +137,24 @@ func (p *languageEvidenceMetaProvider) GetAuthorWorkLanguageEvidence(_ context.C
 	return p.evidence, p.err
 }
 
+type languageEvidenceFillerMetaProvider struct {
+	languageEvidenceMetaProvider
+	fillLanguage string
+	fillCalls    int
+}
+
+func (p *languageEvidenceFillerMetaProvider) FillMissingWorkLanguages(_ context.Context, books []models.Book) int {
+	p.fillCalls++
+	filled := 0
+	for i := range books {
+		if books[i].Language == "" {
+			books[i].Language = p.fillLanguage
+			filled++
+		}
+	}
+	return filled
+}
+
 func (p *stubMetaProvider) Name() string {
 	if p.name != "" {
 		return p.name
@@ -5391,13 +5409,18 @@ func TestFetchAuthorBooks_MajorityLanguageFallbackRescuesUnresolvedWork(t *testi
 		{ForeignID: "OL993W", Title: "Resolved English Three", SortTitle: "resolved english three", Language: "eng",
 			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary"},
 		// No sampled edition reported a language for this one (a real,
-		// common OpenLibrary data gap) — the stub provider doesn't
-		// implement the edition-sample backfill, so this stays blank
-		// exactly as it would when that backfill genuinely can't resolve it.
+		// common OpenLibrary data gap), so the majority fallback must rescue it
+		// even when the evidence capability also reports it as indeterminate.
 		{ForeignID: "OL994W", Title: "Unresolved Language Work", SortTitle: "unresolved language work", Language: "",
 			MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "openlibrary"},
 	}
-	agg := metadata.NewAggregator(&stubMetaProvider{works: works})
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "openlibrary", works: works},
+		evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+			"OL994W": {State: metadata.AuthorWorkLanguageIndeterminate},
+		},
+	}
+	agg := metadata.NewAggregator(provider)
 	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, agg, settingsRepo, profileRepo, nil)
 	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
 
@@ -5412,9 +5435,69 @@ func TestFetchAuthorBooks_MajorityLanguageFallbackRescuesUnresolvedWork(t *testi
 	if !byTitle["Unresolved Language Work"] {
 		t.Error("work with no resolved language should have been rescued by the majority-language fallback, but was skipped")
 	}
+	if provider.calls != 1 {
+		t.Errorf("language evidence calls = %d, want 1", provider.calls)
+	}
 
 	if summary := h.syncSummaries.get(author.ID); summary != nil && summary.SkippedLanguage != 0 {
 		t.Errorf("summary.SkippedLanguage = %d, want 0 (the unresolved work should have been rescued, not skipped)", summary.SkippedLanguage)
+	}
+}
+
+func TestFetchAuthorBooks_EditionSamplingSurvivesIndeterminateEvidence(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile): profile=%+v err=%v", profile, err)
+	}
+	profile.AllowedLanguages = "eng"
+	profile.UnknownLanguageBehavior = models.UnknownLanguageFail
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{
+		ForeignID: "hc:sampled-author", Name: "Sampled Author", SortName: "Author, Sampled",
+		MetadataProvider: "hardcover", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	provider := &languageEvidenceFillerMetaProvider{
+		languageEvidenceMetaProvider: languageEvidenceMetaProvider{
+			stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{{
+				ForeignID: "hc:sampled-work", Title: "Sampled Work", SortTitle: "Sampled Work",
+				MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover",
+			}}},
+			evidence: map[string]metadata.AuthorWorkLanguageEvidence{
+				"hc:sampled-work": {State: metadata.AuthorWorkLanguageIndeterminate},
+			},
+		},
+		fillLanguage: "eng",
+	}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
+
+	books, err := bookRepo.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(books) != 1 || books[0].Language != "eng" {
+		t.Fatalf("books = %+v, want the edition-sampled English work", books)
+	}
+	if provider.calls != 1 || provider.fillCalls != 1 {
+		t.Fatalf("evidence calls=%d fill calls=%d, want 1/1", provider.calls, provider.fillCalls)
+	}
+	if summary := h.syncSummaries.get(author.ID); summary == nil || summary.SkippedLanguage != 0 {
+		t.Fatalf("sync summary = %+v, want no language skips", summary)
 	}
 }
 
@@ -5422,8 +5505,9 @@ func TestFetchAuthorBooks_MajorityLanguageFallbackRescuesUnresolvedWork(t *testi
 // a translated default edition (for example, a Portuguese default for an
 // English work). The default remains useful evidence, but an allowed-language
 // edition found by the bounded Hardcover batch query wins for catalogue
-// filtering. Complete non-allowed evidence and unresolved evidence still
-// honor a strict profile.
+// filtering without rewriting the provider's preferred/display language.
+// Complete non-allowed evidence and unresolved evidence still honor a strict
+// profile.
 func TestFetchAuthorBooks_HardcoverEditionLanguageEvidence(t *testing.T) {
 	database, err := db.OpenMemory()
 	if err != nil {
@@ -5476,14 +5560,15 @@ func TestFetchAuthorBooks_HardcoverEditionLanguageEvidence(t *testing.T) {
 	for _, book := range books {
 		byTitle[book.Title] = book
 	}
-	for _, title := range []string{"Translated Default", "English Default"} {
+	wantLanguage := map[string]string{"Translated Default": "por", "English Default": "eng"}
+	for title, language := range wantLanguage {
 		book, ok := byTitle[title]
 		if !ok {
 			t.Errorf("%q was rejected by the English-only profile", title)
 			continue
 		}
-		if book.Language != "eng" {
-			t.Errorf("%q Language = %q, want resolved allowed language eng", title, book.Language)
+		if book.Language != language {
+			t.Errorf("%q Language = %q, want preferred/display language %q", title, book.Language, language)
 		}
 	}
 	for _, title := range []string{"Foreign Only", "Unresolved"} {
@@ -5499,76 +5584,68 @@ func TestFetchAuthorBooks_HardcoverEditionLanguageEvidence(t *testing.T) {
 	}
 }
 
-func TestFetchAuthorBooks_LanguageEvidenceFailureRemainsUnknown(t *testing.T) {
-	tests := []struct {
-		name            string
-		unknownBehavior string
-		wantBooks       int
-		wantSkipped     int
-	}{
-		{name: "unknown pass keeps work", unknownBehavior: models.UnknownLanguagePass, wantBooks: 1},
-		{name: "unknown fail skips work", unknownBehavior: models.UnknownLanguageFail, wantSkipped: 1},
+func TestFetchAuthorBooks_LanguageEvidenceFailureUsesExistingPipeline(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer database.Close()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			database, err := db.OpenMemory()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer database.Close()
+	ctx := context.Background()
+	authorRepo := db.NewAuthorRepo(database)
+	bookRepo := db.NewBookRepo(database)
+	profileRepo := db.NewMetadataProfileRepo(database)
+	profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
+	if err != nil || profile == nil {
+		t.Fatalf("GetByID(default profile): profile=%+v err=%v", profile, err)
+	}
+	profile.AllowedLanguages = "eng"
+	profile.UnknownLanguageBehavior = models.UnknownLanguageFail
+	if err := profileRepo.Update(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	author := &models.Author{
+		ForeignID: "hc:evidence-error-author", Name: "Evidence Error Author", SortName: "Author, Evidence Error",
+		MetadataProvider: "hardcover", Monitored: false,
+	}
+	if err := authorRepo.Create(ctx, author); err != nil {
+		t.Fatal(err)
+	}
+	works := []models.Book{
+		{ForeignID: "hc:english-one", Title: "English One", SortTitle: "English One", Language: "eng", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+		{ForeignID: "hc:english-two", Title: "English Two", SortTitle: "English Two", Language: "eng", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+		{ForeignID: "hc:english-three", Title: "English Three", SortTitle: "English Three", Language: "eng", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+		{ForeignID: "hc:unresolved", Title: "Unresolved", SortTitle: "Unresolved", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover"},
+	}
+	evidence := make(map[string]metadata.AuthorWorkLanguageEvidence, len(works))
+	for _, work := range works {
+		evidence[work.ForeignID] = metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate}
+	}
+	provider := &languageEvidenceMetaProvider{
+		stubMetaProvider: stubMetaProvider{name: "hardcover", works: works},
+		evidence:         evidence,
+		err:              errors.New("language evidence unavailable"),
+	}
+	h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
+	h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
 
-			ctx := context.Background()
-			authorRepo := db.NewAuthorRepo(database)
-			bookRepo := db.NewBookRepo(database)
-			profileRepo := db.NewMetadataProfileRepo(database)
-			profile, err := profileRepo.GetByID(ctx, models.DefaultMetadataProfileID)
-			if err != nil || profile == nil {
-				t.Fatalf("GetByID(default profile): profile=%+v err=%v", profile, err)
-			}
-			profile.AllowedLanguages = "eng"
-			profile.UnknownLanguageBehavior = tt.unknownBehavior
-			if err := profileRepo.Update(ctx, profile); err != nil {
-				t.Fatal(err)
-			}
-			author := &models.Author{
-				ForeignID: "hc:evidence-error-author", Name: "Evidence Error Author", SortName: "Author, Evidence Error",
-				MetadataProvider: "hardcover", Monitored: false,
-			}
-			if err := authorRepo.Create(ctx, author); err != nil {
-				t.Fatal(err)
-			}
-			provider := &languageEvidenceMetaProvider{
-				stubMetaProvider: stubMetaProvider{name: "hardcover", works: []models.Book{{
-					ForeignID: "hc:translated-default", Title: "Translated Default", SortTitle: "Translated Default",
-					Language: "por", MediaType: models.MediaTypeEbook, Status: models.BookStatusWanted, MetadataProvider: "hardcover",
-				}}},
-				evidence: map[string]metadata.AuthorWorkLanguageEvidence{
-					"hc:translated-default": {State: metadata.AuthorWorkLanguageIndeterminate},
-				},
-				err: errors.New("language evidence unavailable"),
-			}
-			h := NewAuthorHandler(authorRepo, nil, bookRepo, nil, metadata.NewAggregator(provider), nil, profileRepo, nil)
-			h.FetchAuthorBooks(author, false, models.MediaTypeEbook)
-
-			books, err := bookRepo.ListByAuthor(ctx, author.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(books) != tt.wantBooks {
-				t.Fatalf("books = %+v, want %d", books, tt.wantBooks)
-			}
-			if len(books) == 1 && books[0].Language != "" {
-				t.Errorf("persisted language = %q, want unknown after failed evidence lookup", books[0].Language)
-			}
-			if provider.calls != 1 {
-				t.Errorf("language evidence calls = %d, want 1", provider.calls)
-			}
-			summary := h.syncSummaries.get(author.ID)
-			if summary == nil || summary.SkippedLanguage != tt.wantSkipped {
-				t.Fatalf("sync summary = %+v, want skippedLanguage=%d", summary, tt.wantSkipped)
-			}
-		})
+	books, err := bookRepo.ListByAuthor(ctx, author.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(books) != len(works) {
+		t.Fatalf("books = %+v, want all %d works retained by scalar/majority fallbacks", books, len(works))
+	}
+	for _, book := range books {
+		if book.Language != "eng" {
+			t.Errorf("%q language = %q, want eng", book.Title, book.Language)
+		}
+	}
+	if provider.calls != 1 {
+		t.Errorf("language evidence calls = %d, want 1", provider.calls)
+	}
+	if summary := h.syncSummaries.get(author.ID); summary == nil || summary.SkippedLanguage != 0 || summary.Total != len(works) {
+		t.Fatalf("sync summary = %+v, want total=%d and no language skips", summary, len(works))
 	}
 }
 
@@ -5584,6 +5661,67 @@ func TestAuthorWorkPassesLanguageFilter_UnrestrictedProfileIgnoresEvidence(t *te
 	}
 	if book.Language != "por" {
 		t.Fatalf("language = %q, want original display language preserved", book.Language)
+	}
+}
+
+func TestAuthorWorkPassesLanguageFilter_EvidenceFallsBackWithoutMutatingDisplayLanguage(t *testing.T) {
+	tests := []struct {
+		name              string
+		scalarLanguage    string
+		evidence          metadata.AuthorWorkLanguageEvidence
+		unknownFail       bool
+		locked            bool
+		wantAllowed       bool
+		wantIndeterminate bool
+	}{
+		{
+			name: "allowed evidence accepts translated display language", scalarLanguage: "por",
+			evidence: metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageAllowed, Language: "eng"},
+			locked:   true, wantAllowed: true,
+		},
+		{
+			name: "definitive non-allowed evidence rejects allowed scalar", scalarLanguage: "eng",
+			evidence: metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageNotAllowed, Language: "spa"},
+		},
+		{
+			name: "indeterminate blank strict", evidence: metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate},
+			unknownFail: true, wantIndeterminate: true,
+		},
+		{
+			name: "indeterminate blank permissive", evidence: metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate},
+			wantAllowed: true, wantIndeterminate: true,
+		},
+		{
+			name: "indeterminate allowed scalar", scalarLanguage: "eng",
+			evidence:    metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate},
+			unknownFail: true, wantAllowed: true,
+		},
+		{
+			name: "indeterminate non-allowed scalar", scalarLanguage: "spa",
+			evidence:    metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate},
+			unknownFail: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			book := models.Book{ForeignID: "hc:work", Language: tt.scalarLanguage}
+			if tt.locked {
+				book.LockField(models.BookFieldLanguage)
+			}
+			evidence := map[string]metadata.AuthorWorkLanguageEvidence{"hc:work": tt.evidence}
+
+			allowed, indeterminate := authorWorkPassesLanguageFilter(&book, []string{"eng"}, tt.unknownFail, evidence)
+			if allowed != tt.wantAllowed || indeterminate != tt.wantIndeterminate {
+				t.Fatalf("allowed=%v indeterminate=%v, want %v/%v", allowed, indeterminate, tt.wantAllowed, tt.wantIndeterminate)
+			}
+			if book.Language != tt.scalarLanguage {
+				t.Fatalf("language = %q, want display language unchanged at %q", book.Language, tt.scalarLanguage)
+			}
+			if tt.locked && !book.IsFieldLocked(models.BookFieldLanguage) {
+				t.Fatal("language field lock was lost")
+			}
+		})
 	}
 }
 

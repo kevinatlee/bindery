@@ -115,16 +115,19 @@ type authorWorkLanguageEvidenceProvider interface {
 }
 
 // GetAuthorWorkLanguageEvidence asks the primary provider for bounded,
-// profile-specific edition evidence. Unsupported providers return nil. A
-// provider may return indeterminate entries alongside an error so callers can
-// preserve strict ingestion behavior without turning a failed lookup into
-// destructive reconciliation evidence.
+// profile-specific edition evidence. Unsupported providers return nil. Failed
+// lookups never return evidence: a secondary lookup error must leave the
+// existing scalar, edition-sampled, and majority-language pipeline unchanged.
 func (a *Aggregator) GetAuthorWorkLanguageEvidence(ctx context.Context, books []models.Book, allowed []string) (map[string]AuthorWorkLanguageEvidence, error) {
 	resolver, ok := a.primary.(authorWorkLanguageEvidenceProvider)
 	if !ok || len(allowed) == 0 {
 		return nil, nil
 	}
-	return resolver.GetAuthorWorkLanguageEvidence(ctx, books, allowed)
+	evidence, err := resolver.GetAuthorWorkLanguageEvidence(ctx, books, allowed)
+	if err != nil {
+		return nil, err
+	}
+	return evidence, nil
 }
 
 // FillMissingAuthorWorkLanguages asks the primary provider to derive a language

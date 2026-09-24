@@ -800,6 +800,7 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 		for _, fragment := range []string{
 			"distinct_on: [book_id]",
 			"order_by: [{book_id: asc}, {id: asc}]",
+			"limit: $limit",
 			"language { code2 code3 language }",
 			"code2: {_in: $languageCodes}",
 			"code3: {_in: $languageCodes}",
@@ -822,6 +823,9 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 		bookIDs, ok := req.Variables["bookIds"].([]interface{})
 		if !ok || len(bookIDs) != 1 || bookIDs[0] != float64(42) {
 			t.Errorf("bookIds = %#v, want [42]", req.Variables["bookIds"])
+		}
+		if limit := req.Variables["limit"]; limit != float64(6) {
+			t.Errorf("limit = %#v, want 6 unique applicable works", limit)
 		}
 		return gqlResponse(t, http.StatusOK, map[string]interface{}{
 			"editions": []map[string]interface{}{
@@ -856,6 +860,7 @@ func TestGetAuthorWorkLanguageEvidence_BatchesAllowedEditionLookup(t *testing.T)
 		{ForeignID: "hc:unknown"},
 		{ForeignID: "hc:42", Language: "spa"},
 		{ForeignID: "hc:malformed-language", Language: "por"},
+		{ForeignID: "hc:translated-default", Language: "por"},
 		{ForeignID: "hc:   ", Language: "eng"},
 		{ForeignID: "audible:B01CZ0WTEM", Language: "eng"},
 	}
@@ -929,13 +934,13 @@ func TestGetAuthorWorkLanguageEvidence_SkipsRequestsWithoutApplicableInput(t *te
 		if requests != 0 {
 			t.Fatalf("requests = %d, want 0", requests)
 		}
-		if evidence := got["hc:translated-default"]; evidence.State != metadata.AuthorWorkLanguageIndeterminate {
-			t.Fatalf("evidence = %+v, want indeterminate", evidence)
+		if got != nil {
+			t.Fatalf("evidence = %#v, want nil on configuration failure", got)
 		}
 	})
 }
 
-func TestGetAuthorWorkLanguageEvidence_FailureIsIndeterminate(t *testing.T) {
+func TestGetAuthorWorkLanguageEvidence_FailureReturnsNoEvidence(t *testing.T) {
 	c := newMockClient(func(*http.Request) (*http.Response, error) {
 		return gqlResponse(t, http.StatusInternalServerError, `{"error":"upstream unavailable"}`), nil
 	})
@@ -945,15 +950,26 @@ func TestGetAuthorWorkLanguageEvidence_FailureIsIndeterminate(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected lookup error")
 	}
-	if evidence := got["hc:translated-default"]; evidence.State != metadata.AuthorWorkLanguageIndeterminate {
-		t.Fatalf("evidence after failure = %+v, want indeterminate", evidence)
+	if got != nil {
+		t.Fatalf("evidence after failure = %#v, want nil", got)
 	}
 }
 
 func TestGetAuthorWorkLanguageEvidence_SeventyEightWorksUseOneRequest(t *testing.T) {
 	requests := 0
-	c := newMockClient(func(*http.Request) (*http.Response, error) {
+	c := newMockClient(func(r *http.Request) (*http.Response, error) {
 		requests++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var req gqlRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatal(err)
+		}
+		if limit := req.Variables["limit"]; limit != float64(78) {
+			t.Errorf("limit = %#v, want 78", limit)
+		}
 		return gqlResponse(t, http.StatusOK, map[string]interface{}{"editions": []interface{}{}}), nil
 	})
 	books := make([]models.Book, 78)
@@ -969,6 +985,29 @@ func TestGetAuthorWorkLanguageEvidence_SeventyEightWorksUseOneRequest(t *testing
 	}
 	if len(got) != len(books) {
 		t.Fatalf("evidence rows = %d, want %d", len(got), len(books))
+	}
+}
+
+func TestGetAuthorWorkLanguageEvidence_RejectsCatalogueBeyondBound(t *testing.T) {
+	requests := 0
+	c := newMockClient(func(*http.Request) (*http.Response, error) {
+		requests++
+		return gqlResponse(t, http.StatusOK, map[string]interface{}{"editions": []interface{}{}}), nil
+	})
+	books := make([]models.Book, authorWorksMaxBooks+1)
+	for i := range books {
+		books[i] = models.Book{ForeignID: fmt.Sprintf("hc:work-%d", i), Language: "por"}
+	}
+
+	got, err := c.GetAuthorWorkLanguageEvidence(context.Background(), books, []string{"eng"})
+	if err == nil {
+		t.Fatal("expected an over-bound catalogue error")
+	}
+	if got != nil {
+		t.Fatalf("evidence = %#v, want nil when completeness cannot be guaranteed", got)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want 0 for a catalogue beyond the safe bound", requests)
 	}
 }
 

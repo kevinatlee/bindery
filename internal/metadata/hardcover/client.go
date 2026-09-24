@@ -351,12 +351,14 @@ func (c *Client) GetAuthorWorks(ctx context.Context, authorForeignID string) ([]
 // bounded GraphQL query for the whole author catalogue. It asks only whether
 // each Hardcover work has an edition in one of the profile's allowed
 // languages and uses distinct_on(book_id), so the response contains at most
-// one small row per work (GetAuthorWorks itself caps the catalogue at 500).
+// one small row per work. The explicit limit equals the unique requested work
+// count and never exceeds GetAuthorWorks' 500-work catalogue cap.
 //
 // A non-allowed default edition is enough to prove that some language evidence
 // exists, but it is not enough to reject the work. Rejection becomes
 // authoritative only after this complete query finds no allowed-language
-// edition. On any query failure every Hardcover work remains indeterminate.
+// edition. A query failure returns no evidence so the caller can retain its
+// existing scalar and fallback language behavior.
 func (c *Client) GetAuthorWorkLanguageEvidence(ctx context.Context, books []models.Book, allowed []string) (map[string]metadata.AuthorWorkLanguageEvidence, error) {
 	evidence := make(map[string]metadata.AuthorWorkLanguageEvidence)
 	if len(allowed) == 0 {
@@ -374,6 +376,9 @@ func (c *Client) GetAuthorWorkLanguageEvidence(ctx context.Context, books []mode
 		if id == "" {
 			continue
 		}
+		if _, exists := evidence[key]; exists {
+			continue
+		}
 		evidence[key] = metadata.AuthorWorkLanguageEvidence{State: metadata.AuthorWorkLanguageIndeterminate}
 		slugs = append(slugs, id)
 		if numericID, ok := hardcoverNumericID(id); ok {
@@ -383,11 +388,14 @@ func (c *Client) GetAuthorWorkLanguageEvidence(ctx context.Context, books []mode
 	if len(evidence) == 0 {
 		return evidence, nil
 	}
+	if len(evidence) > authorWorksMaxBooks {
+		return nil, fmt.Errorf("hardcover get author work language evidence: %d unique works exceeds limit %d", len(evidence), authorWorksMaxBooks)
+	}
 	if c.authorizationToken(ctx) == "" {
-		return evidence, metadata.ErrProviderNotConfigured
+		return nil, metadata.ErrProviderNotConfigured
 	}
 
-	const gql = `query GetAuthorWorkLanguageEvidence($slugs: [String!]!, $bookIds: [Int!]!, $languageCodes: [String!]!) {
+	const gql = `query GetAuthorWorkLanguageEvidence($slugs: [String!]!, $bookIds: [Int!]!, $languageCodes: [String!]!, $limit: Int!) {
 		editions(
 			where: {
 				_and: [
@@ -396,7 +404,8 @@ func (c *Client) GetAuthorWorkLanguageEvidence(ctx context.Context, books []mode
 				]
 			},
 			distinct_on: [book_id],
-			order_by: [{book_id: asc}, {id: asc}]
+			order_by: [{book_id: asc}, {id: asc}],
+			limit: $limit
 		) {
 			book { id slug }
 			language { code2 code3 language }
@@ -414,11 +423,12 @@ func (c *Client) GetAuthorWorkLanguageEvidence(ctx context.Context, books []mode
 		"slugs":         slugs,
 		"bookIds":       bookIDs,
 		"languageCodes": models.LanguageCodeVariants(allowed),
+		"limit":         len(evidence),
 	}, &resp); err != nil {
-		return evidence, fmt.Errorf("hardcover get author work language evidence: %w", err)
+		return nil, fmt.Errorf("hardcover get author work language evidence: %w", err)
 	}
 
-	// A successful, unpaginated distinct query proves absence of an allowed
+	// A successful, explicitly bounded distinct query proves absence of an allowed
 	// edition. Preserve the default edition only as known non-allowed evidence;
 	// it never gets to overrule a matching edition returned below.
 	for _, book := range books {

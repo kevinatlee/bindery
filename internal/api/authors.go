@@ -1880,7 +1880,8 @@ func (h *AuthorHandler) runCatalogueSync(ctx context.Context, author *models.Aut
 		var languageEvidenceErr error
 		languageEvidence, languageEvidenceErr = h.meta.GetAuthorWorkLanguageEvidence(ctx, books, allowedLangs)
 		if languageEvidenceErr != nil {
-			slog.Warn("author work language evidence lookup failed; unresolved works remain unknown",
+			languageEvidence = nil
+			slog.Warn("author work language evidence lookup failed; using existing language fallbacks",
 				"author", author.Name, "error", languageEvidenceErr)
 		}
 	}
@@ -3452,9 +3453,10 @@ func applyAuthorMajorityLanguageFallback(books []models.Book) {
 }
 
 // authorWorkPassesLanguageFilter applies provider-supplied edition evidence
-// when available and falls back to the work's scalar language otherwise.
-// Indeterminate evidence deliberately clears a translated default-edition
-// language so callers cannot mistake it for authoritative work metadata.
+// when it is definitive and otherwise falls through to the work's scalar
+// language. Evidence is filter-only: it never rewrites the preferred/display
+// language, and an indeterminate result cannot discard edition sampling or the
+// author-majority fallback that already resolved the scalar.
 func authorWorkPassesLanguageFilter(book *models.Book, allowed []string, unknownFail bool, evidence map[string]metadata.AuthorWorkLanguageEvidence) (bool, bool) {
 	if len(allowed) == 0 {
 		return true, false
@@ -3462,16 +3464,9 @@ func authorWorkPassesLanguageFilter(book *models.Book, allowed []string, unknown
 	if resolved, ok := evidence[strings.TrimSpace(book.ForeignID)]; ok {
 		switch resolved.State {
 		case metadata.AuthorWorkLanguageAllowed:
-			book.Language = models.NormalizeLanguageCode(resolved.Language)
 			return true, false
 		case metadata.AuthorWorkLanguageNotAllowed:
-			if language := models.NormalizeLanguageCode(resolved.Language); language != "" {
-				book.Language = language
-			}
 			return false, false
-		default:
-			book.Language = ""
-			return !unknownFail, true
 		}
 	}
 	if strings.TrimSpace(book.Language) == "" {
